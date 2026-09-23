@@ -1,0 +1,41 @@
+services:
+  web:
+    build:
+      context: .
+      target: backend
+    image: sealing-desk:latest
+    container_name: sealing-desk-web
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    volumes:
+      # Confirmed chunks and receipts live here, surviving restarts/rebuilds.
+      - ./data:/data
+    environment:
+      DATA_DIR: /data
+      STATIC_DIR: /app/frontend/dist
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    restart: unless-stopped
+
+  # One-shot: backend tests -> frontend production build -> HTTP smoke against
+  # the running web service. Exits non-zero on the first failure.
+  verify:
+    build:
+      context: .
+      target: verify
+    image: sealing-desk-verify:latest
+    container_name: sealing-desk-verify
+    environment:
+      BASE_URL: http://web:8000
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: "no"
