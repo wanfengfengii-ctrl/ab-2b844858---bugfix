@@ -419,6 +419,12 @@ export default function App() {
                 </div>
               )}
               <AuditLine label="本次修复块" ranges={audit.repaired_ranges} />
+              {audit.status === "REPAIRING" && (
+                <em className="sub">
+                  修复进行中：以上异常范围冻结自修复开始时刻（{audit.repair_started_at ?? "时间未知"}），
+                  修复期间连续复核不会漂移；完成后复核将收敛为 HEALTHY。
+                </em>
+              )}
               <div className="digest">
                 回执摘要：{audit.receipt_sha256} · 封存时间 {audit.sealed_at}
               </div>

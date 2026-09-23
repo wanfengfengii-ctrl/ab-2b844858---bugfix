@@ -8,6 +8,10 @@ Each session lives in a single directory holding:
                      the receipt for new sessions; backfilled on the first
                      successful audit of a legacy (pre-index) session
   repair/         – present only while an original-file repair is in flight:
+    plan.json     – the abnormal block scope frozen at repair start, written
+                    BEFORE the source marker. Concurrent audits answer
+                    REPAIRING promptly from this snapshot, so the reported
+                    scope never drifts while chunks are gradually restored.
     source        – the fully validated original file (length AND whole-file
                     digest match the receipt); its atomic appearance is the
                     persistent commit marker. An interrupted request or a
@@ -28,6 +32,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -46,6 +51,8 @@ _BLOCK_INDEX_VERSION = 1
 _BLOCK_INDEX_FILE = "block_index.json"
 _REPAIR_DIR = "repair"
 _REPAIR_SOURCE = "source"
+_REPAIR_PLAN = "plan.json"
+_REPAIR_PLAN_VERSION = 1
 
 # Audit statuses returned over HTTP.
 HEALTHY = "HEALTHY"
@@ -176,6 +183,18 @@ class UploadStore:
         self.root = os.path.abspath(root)
         os.makedirs(self.root, exist_ok=True)
         self._lock = threading.RLock()
+        # Repairs that have been accepted but whose validated source marker
+        # may not yet be visible on disk. An audit arriving in that window
+        # polls (bounded, and never on the write lock) for the marker and
+        # can still answer REPAIRING promptly once it appears.
+        self._repair_guard = threading.Lock()
+        self._active_repairs: dict[str, int] = {}
+        # Optional per-chunk settle delay during repair, in seconds. Zero in
+        # normal operation; tests/compose can widen the repair window to
+        # exercise concurrent audit behaviour deterministically.
+        self._repair_chunk_delay = float(
+            os.environ.get("REPAIR_CHUNK_DELAY", "0") or 0
+        )
         # Service restart: continue every interrupted, validated repair so
         # the session converges even without a new client request.
         self._resume_all_repairs()
@@ -205,6 +224,9 @@ class UploadStore:
 
     def _repair_source_path(self, session: str) -> str:
         return os.path.join(self._repair_dir(session), _REPAIR_SOURCE)
+
+    def _repair_plan_path(self, session: str) -> str:
+        return os.path.join(self._repair_dir(session), _REPAIR_PLAN)
 
     # ---- reads -----------------------------------------------------------
 
@@ -598,11 +620,30 @@ class UploadStore:
 
         Returns None for an unknown session; raises ConflictError for an
         unsealed one. A legacy session that passes gets its trusted index
-        backfilled. An interrupted-but-already-converged repair marker is
-        finalized; an actually pending repair is reported as REPAIRING.
+        backfilled. While a validated repair is staged, the audit answers
+        promptly from the frozen repair plan (REPAIRING) instead of
+        blocking on the repair lock; an interrupted-but-already-converged
+        repair marker is finalized and reported HEALTHY.
         """
         _validate_session(session)
+        # Wait briefly for an accepted-but-not-yet-staged repair to publish
+        # its marker. Bounded and never on the write lock, so an audit
+        # either joins the repair window promptly or proceeds at once.
+        self._await_repair_marker(session)
+        # Fast path: a validated repair is in flight. Chunk files only ever
+        # change via atomic rename, so these lock-free reads always see a
+        # consistent snapshot — no need to wait for the repair to finish.
+        if os.path.exists(self._repair_source_path(session)):
+            payload = self._audit_while_repairing(session)
+            if payload is not None:
+                return payload
         with self._lock:
+            # A repair that won the lock race staged its marker under the
+            # same lock, so it is visible by now.
+            if os.path.exists(self._repair_source_path(session)):
+                payload = self._audit_while_repairing(session)
+                if payload is not None:
+                    return payload
             meta = self.get_metadata(session)
             if meta is None:
                 return None
@@ -613,26 +654,64 @@ class UploadStore:
                     "after sealing and never changes upload progress",
                     reason="not_sealed",
                 )
-
             result = self._classify(session, meta, receipt)
-            repair_pending = os.path.exists(self._repair_source_path(session))
-
-            if repair_pending:
-                if result.is_clean():
-                    # All chunks already match; only the cleanup was cut off.
-                    # No chunk is written here, the marker is just finalized.
-                    if self._whole_digest(session, meta) == receipt["sha256"]:
-                        if not result.index_present:
-                            self._backfill_index_from_source(session, meta)
-                        self._remove_repair_dir(session)
-                        return self._audit_payload(session, result, receipt, HEALTHY)
-                payload = self._audit_payload(session, result, receipt, REPAIRING)
-                payload["repaired_ranges"] = []
-                return payload
-
             if result.is_clean():
                 return self._audit_payload(session, result, receipt, HEALTHY)
             return self._audit_payload(session, result, receipt, DEGRADED)
+
+    def _audit_while_repairing(self, session: str) -> Optional[dict]:
+        """Audit report for a session with a staged repair source.
+
+        Returns None when the session state is inconsistent, letting the
+        caller fall back to the regular locked path. Never waits for a
+        running repair, except to finalize one that already converged.
+        """
+        meta = self.get_metadata(session)
+        receipt = self._read_receipt(session)
+        if meta is None or receipt is None:
+            return None
+        if self._whole_digest(session, meta) == receipt["sha256"]:
+            # All chunks already match; only the cleanup was cut off. No
+            # chunk is written here, the marker is just finalized.
+            with self._lock:
+                if os.path.exists(self._repair_source_path(session)):
+                    if self._load_index(session, meta) is None:
+                        self._backfill_index_from_source(session, meta)
+                    self._remove_repair_dir(session)
+            result = _Classification(index_present=True)
+            return self._audit_payload(session, result, receipt, HEALTHY)
+        # Repair still in flight: report the scope frozen at repair start,
+        # so concurrent audits observe one stable range that never drifts
+        # while chunks are gradually restored.
+        plan = self._read_repair_plan(session)
+        if plan is not None:
+            result = _Classification(
+                index_present=self._load_index(session, meta) is not None
+            )
+            payload = self._audit_payload(session, result, receipt, REPAIRING)
+            payload["missing_ranges"] = plan["missing_ranges"]
+            payload["length_error_ranges"] = plan["length_error_ranges"]
+            payload["block_digest_error_ranges"] = plan["block_digest_error_ranges"]
+            payload["unlocatable_digest_mismatch"] = plan[
+                "unlocatable_digest_mismatch"
+            ]
+            payload["abnormal_ranges"] = plan["abnormal_ranges"]
+            payload["repair_started_at"] = plan["started_at"]
+            return payload
+        # Marker without a plan (staged by an older version): no in-process
+        # repair can be holding the lock, so a locked live classification
+        # cannot block behind a repair.
+        with self._lock:
+            if not os.path.exists(self._repair_source_path(session)):
+                # The repair converged while we were reading: report the
+                # post-repair truth instead of a stale REPAIRING.
+                result = self._classify(session, meta, receipt)
+                status = HEALTHY if result.is_clean() else DEGRADED
+                return self._audit_payload(session, result, receipt, status)
+            result = self._classify(session, meta, receipt)
+            payload = self._audit_payload(session, result, receipt, REPAIRING)
+            payload["repair_started_at"] = None
+            return payload
 
     # ---- original-file repair -------------------------------------------
 
@@ -644,44 +723,172 @@ class UploadStore:
         copy is staged as repair/source (the persistent progress marker);
         chunk replacement is idempotent and resumes after interruption or
         restart. The receipt and its sealed_at timestamp never change.
+
+        An accepted repair is registered BEFORE the write lock is taken, so
+        a concurrent audit never queues behind the chunk replacements: it
+        waits for the source marker (published together with the frozen
+        repair plan) and then answers REPAIRING from that plan.
         """
         _validate_session(session)
         if not isinstance(data, (bytes, bytearray)):
             raise RejectError("repair payload must be the raw original file")
         data = bytes(data)
 
-        with self._lock:
-            meta = self.get_metadata(session)
-            if meta is None:
-                return None
-            receipt = self._read_receipt(session)
-            if receipt is None:
-                raise ConflictError(
-                    "session is not sealed: repair is only available after sealing",
-                    reason="not_sealed",
-                )
-
-            # Wrong-file attempts are rejected before any on-disk state
-            # changes; an already validated repair source is left untouched.
+        # Gate on the immutable meta/receipt files (both written atomically,
+        # so these lock-free reads are authoritative). Wrong files are
+        # rejected before any on-disk state changes; an already validated
+        # repair source is left untouched.
+        meta = self.get_metadata(session)
+        receipt = self._read_receipt(session) if meta is not None else None
+        registration: Optional[tuple[str, int]] = None
+        if meta is not None and receipt is not None:
             if len(data) != int(receipt["total_size"]):
                 raise ConflictError(
                     f"uploaded file length {len(data)} does not match receipt "
                     f"length {receipt['total_size']}",
                     reason="length_mismatch",
                 )
-            actual_digest = hashlib.sha256(data).hexdigest()
-            if actual_digest != receipt["sha256"]:
+            if hashlib.sha256(data).hexdigest() != receipt["sha256"]:
                 raise ConflictError(
                     "uploaded file SHA-256 does not match the receipt digest",
                     reason="digest_mismatch",
                 )
+            # Sealed and validated: register BEFORE the write lock so a
+            # concurrent audit arriving in the staging gap joins the repair
+            # window instead of queuing behind chunk replacements.
+            registration = self._begin_repair(session)
+        try:
+            with self._lock:
+                # Re-decide under the lock so unknown/unsealed sessions
+                # and concurrent seal progress are observed exactly.
+                meta = self.get_metadata(session)
+                if meta is None:
+                    return None
+                receipt = self._read_receipt(session)
+                if receipt is None:
+                    raise ConflictError(
+                        "session is not sealed: repair is only available "
+                        "after sealing",
+                        reason="not_sealed",
+                    )
+                if registration is None:
+                    # The session was sealed between the lock-free gate and
+                    # the lock: register now (audits waiting for the lock
+                    # see the staged marker anyway).
+                    registration = self._begin_repair(session)
+                if len(data) != int(receipt["total_size"]):
+                    raise ConflictError(
+                        f"uploaded file length {len(data)} does not match "
+                        f"receipt length {receipt['total_size']}",
+                        reason="length_mismatch",
+                    )
+                if hashlib.sha256(data).hexdigest() != receipt["sha256"]:
+                    raise ConflictError(
+                        "uploaded file SHA-256 does not match the receipt "
+                        "digest",
+                        reason="digest_mismatch",
+                    )
 
-            self._stage_source(session, data)
-            return self._apply_validated_source(session)
+                if self._validated_source_exists(session, receipt):
+                    # A repair for this session is already in flight (or was
+                    # interrupted). Resuming from the persisted source keeps
+                    # the frozen start scope stable for concurrent audits;
+                    # re-staging would shrink the plan mid-repair.
+                    return self._apply_validated_source(session)
 
-    def _stage_source(self, session: str, data: bytes) -> None:
+                scope = self._classify_against_source(session, meta, data)
+                if not scope.abnormal() and not scope.unlocatable_digest_mismatch:
+                    # Nothing to heal: never open a repair window, so a
+                    # duplicate repair cannot flip audits to REPAIRING. The
+                    # validated original is authoritative for the index.
+                    self._write_index(
+                        session, meta, self._source_index_entries(meta, data)
+                    )
+                    return self._repair_payload(session, receipt, repaired=[])
+                # The frozen plan and the validated source become visible
+                # atomically here; waiting audits then report the window.
+                self._stage_source(session, data, scope)
+                return self._apply_validated_source(session)
+        finally:
+            if registration is not None:
+                self._end_repair(registration)
+
+    def _repair_payload(
+        self, session: str, receipt: dict, repaired: list[int]
+    ) -> dict:
+        return {
+            "session": session,
+            "status": HEALTHY,
+            "sealed": True,
+            "repaired_ranges": _ranges(set(repaired)),
+            "abnormal_ranges": [],
+            "already_healthy": not repaired,
+            "receipt_sha256": receipt["sha256"],
+            "sealed_at": receipt["sealed_at"],
+            "completed_at": _utcnow(),
+        }
+
+    def _begin_repair(self, session: str) -> tuple[str, int]:
+        with self._repair_guard:
+            n = self._active_repairs.get(session, 0) + 1
+            self._active_repairs[session] = n
+            return session, n
+
+    def _end_repair(self, registration: tuple[str, int]) -> None:
+        session, _ = registration
+        with self._repair_guard:
+            n = self._active_repairs.get(session, 1) - 1
+            if n <= 0:
+                self._active_repairs.pop(session, None)
+            else:
+                self._active_repairs[session] = n
+
+    def _repair_active(self, session: str) -> bool:
+        with self._repair_guard:
+            return self._active_repairs.get(session, 0) > 0
+
+    def _await_repair_marker(self, session: str, timeout: float = 2.0) -> None:
+        """Wait briefly for the repair marker without the write lock.
+
+        Returns as soon as repair/source exists, when no in-process repair
+        is active, or after the bounded timeout. An audit landing in the
+        acceptance->staging gap joins the REPAIRING window this way instead
+        of racing for the write lock behind the chunk replacements.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if os.path.exists(self._repair_source_path(session)):
+                return
+            if not self._repair_active(session):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.005, remaining))
+
+    def _validated_source_exists(self, session: str, receipt: dict) -> bool:
+        """True when a staged repair/source already matches the receipt."""
+        path = self._repair_source_path(session)
+        try:
+            if os.path.getsize(path) != int(receipt["total_size"]):
+                return False
+            with open(path, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest() == receipt["sha256"]
+        except (FileNotFoundError, OSError):
+            return False
+
+    def _stage_source(
+        self, session: str, data: bytes, scope: Optional[_Classification] = None
+    ) -> None:
         repair_dir = self._repair_dir(session)
         os.makedirs(repair_dir, exist_ok=True)
+        # Freeze the abnormal scope first: a concurrent audit that already
+        # sees the source marker must always find a plan to report.
+        meta = self.get_metadata(session)
+        if meta is not None:
+            if scope is None:
+                scope = self._classify_against_source(session, meta, data)
+            self._write_repair_plan(session, scope)
         # Spool to a temp file, fsync, then atomically publish: source only
         # ever appears fully validated.
         fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=repair_dir)
@@ -697,6 +904,69 @@ class UploadStore:
                 os.unlink(tmp)
             raise
 
+    def _classify_against_source(
+        self, session: str, meta: Metadata, source: bytes
+    ) -> _Classification:
+        """Locate every block that differs from the validated original.
+
+        The original file just passed the receipt length + digest gate, so
+        it is authoritative; this comparison even locates bit-rot for legacy
+        sessions that lack a trusted per-chunk index.
+        """
+        result = _Classification(
+            index_present=self._load_index(session, meta) is not None
+        )
+        for i in range(meta.chunk_count):
+            start = i * CHUNK_SIZE
+            expected = source[start : start + self._expected_block_size(meta, i)]
+            current = self._read_block(session, i)
+            if current is None:
+                result.missing.add(i)
+            elif len(current) != len(expected):
+                result.bad_length.add(i)
+            elif hashlib.sha256(current).hexdigest() != hashlib.sha256(
+                expected
+            ).hexdigest():
+                result.bad_digest.add(i)
+        return result
+
+    def _write_repair_plan(self, session: str, result: _Classification) -> None:
+        payload = {
+            "version": _REPAIR_PLAN_VERSION,
+            "started_at": _utcnow(),
+            "missing_ranges": _ranges(result.missing),
+            "length_error_ranges": _ranges(result.bad_length),
+            "block_digest_error_ranges": _ranges(result.bad_digest),
+            "unlocatable_digest_mismatch": result.unlocatable_digest_mismatch,
+            "abnormal_ranges": _ranges(result.abnormal()),
+        }
+        _atomic_write(self._repair_plan_path(session), json.dumps(payload).encode())
+
+    def _read_repair_plan(self, session: str) -> Optional[dict]:
+        """Load the frozen repair plan; any malformed file is ignored."""
+        try:
+            raw = _read_json(self._repair_plan_path(session))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        try:
+            if int(raw.get("version")) != _REPAIR_PLAN_VERSION:
+                return None
+            plan = {
+                "started_at": raw.get("started_at"),
+                "missing_ranges": [list(r) for r in raw["missing_ranges"]],
+                "length_error_ranges": [list(r) for r in raw["length_error_ranges"]],
+                "block_digest_error_ranges": [
+                    list(r) for r in raw["block_digest_error_ranges"]
+                ],
+                "unlocatable_digest_mismatch": bool(
+                    raw.get("unlocatable_digest_mismatch", False)
+                ),
+                "abnormal_ranges": [list(r) for r in raw["abnormal_ranges"]],
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+        return plan
+
     def _apply_validated_source(self, session: str) -> dict:
         """Replace every abnormal chunk from repair/source; idempotent.
 
@@ -708,8 +978,13 @@ class UploadStore:
         if meta is None or receipt is None:
             raise RejectError("repair source exists but session metadata is gone")
         source_path = self._repair_source_path(session)
-        with open(source_path, "rb") as fh:
-            source = fh.read()
+        try:
+            with open(source_path, "rb") as fh:
+                source = fh.read()
+        except FileNotFoundError:
+            # Another repair converged and removed the marker while we
+            # waited for the lock: nothing left to resume.
+            return self._repair_payload(session, receipt, repaired=[])
         # Re-validate the staged source before trusting it (tamper-proofing).
         if len(source) != int(receipt["total_size"]) or hashlib.sha256(
             source
@@ -730,6 +1005,8 @@ class UploadStore:
             if current != expected:
                 # Missing, wrong-length or bit-rotted block: the only code
                 # path allowed to write into a sealed session's chunks.
+                if self._repair_chunk_delay > 0:
+                    time.sleep(self._repair_chunk_delay)
                 _atomic_write(path, expected)
                 repaired.append(i)
 
@@ -743,7 +1020,13 @@ class UploadStore:
 
         # The validated original is authoritative: always (re)build the
         # trusted index from it, even if a stale/tampered index was present.
-        entries = [
+        self._write_index(session, meta, self._source_index_entries(meta, source))
+
+        self._remove_repair_dir(session)
+        return self._repair_payload(session, receipt, repaired)
+
+    def _source_index_entries(self, meta: Metadata, source: bytes) -> list[dict]:
+        return [
             {
                 "index": i,
                 "size": self._expected_block_size(meta, i),
@@ -756,43 +1039,18 @@ class UploadStore:
             }
             for i in range(meta.chunk_count)
         ]
-        self._write_index(session, meta, entries)
-
-        self._remove_repair_dir(session)
-        return {
-            "session": session,
-            "status": HEALTHY,
-            "sealed": True,
-            "repaired_ranges": _ranges(set(repaired)),
-            "abnormal_ranges": [],
-            "already_healthy": not repaired,
-            "receipt_sha256": receipt["sha256"],
-            "sealed_at": receipt["sealed_at"],
-            "completed_at": _utcnow(),
-        }
 
     def _backfill_index_from_source(self, session: str, meta: Metadata) -> None:
         with open(self._repair_source_path(session), "rb") as fh:
             source = fh.read()
-        entries = [
-            {
-                "index": i,
-                "size": self._expected_block_size(meta, i),
-                "sha256": hashlib.sha256(
-                    source[
-                        i * CHUNK_SIZE : i * CHUNK_SIZE
-                        + self._expected_block_size(meta, i)
-                    ]
-                ).hexdigest(),
-            }
-            for i in range(meta.chunk_count)
-        ]
-        self._write_index(session, meta, entries)
+        self._write_index(session, meta, self._source_index_entries(meta, source))
 
     def _remove_repair_dir(self, session: str) -> None:
         repair_dir = self._repair_dir(session)
         with contextlib.suppress(FileNotFoundError):
             os.unlink(self._repair_source_path(session))
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self._repair_plan_path(session))
         with contextlib.suppress(FileNotFoundError, OSError):
             os.rmdir(repair_dir)
         with contextlib.suppress(OSError):

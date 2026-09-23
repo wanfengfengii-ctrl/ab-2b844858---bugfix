@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -397,6 +399,351 @@ def test_restart_without_staged_source_stays_degraded(client, tmp_path):
     data_dir = tmp_path / "data"
     web.store = UploadStore(str(data_dir))
     assert client.post("/api/uploads/fix/audit").json()["status"] == "DEGRADED"
+
+
+# ---------------------------------------------------------------------------
+# concurrent audits inside an active repair window (the reported bug)
+# ---------------------------------------------------------------------------
+
+
+def _wait_for(path, timeout=5.0):
+    deadline = time.time() + timeout
+    while not path.exists():
+        assert time.time() < deadline, f"{path} never appeared"
+        time.sleep(0.005)
+
+
+def test_audit_during_live_repair_is_prompt_repairing_with_frozen_scope(
+    client, tmp_path
+):
+    blob, sha, receipt = _sealed_session(client, "fix")
+    os.unlink(_chunk_path(tmp_path, "fix", 0))
+    p = _chunk_path(tmp_path, "fix", 1)
+    raw = bytearray(p.read_bytes())
+    raw[9] ^= 0x55
+    p.write_bytes(bytes(raw))
+
+    store = web.store
+    store._repair_chunk_delay = 0.25  # widen the repair window deterministically
+
+    repair_result = {}
+
+    def do_repair():
+        repair_result["body"] = store.repair("fix", blob)
+
+    t = threading.Thread(target=do_repair)
+    t.start()
+    try:
+        _wait_for(tmp_path / "data" / "fix" / "repair" / "source")
+
+        reports = []
+        for _ in range(4):
+            start = time.time()
+            report = store.audit("fix")
+            elapsed = time.time() - start
+            # The audit must answer promptly instead of waiting for repair end.
+            assert elapsed < 1.0, f"audit blocked for {elapsed:.2f}s"
+            assert report["status"] == "REPAIRING"
+            # Frozen at repair start: even while block 0 may already be back,
+            # every audit in this repair reports the same full scope.
+            assert report["missing_ranges"] == [[0, 0]]
+            assert report["block_digest_error_ranges"] == [[1, 1]]
+            assert report["abnormal_ranges"] == [[0, 1]]
+            assert report["repaired_ranges"] == []
+            assert report["repair_started_at"]
+            reports.append(report)
+            time.sleep(0.05)
+
+        stable = [{k: v for k, v in r.items() if k != "checked_at"} for r in reports]
+        assert all(r == stable[0] for r in stable), "repair scope drifted mid-repair"
+    finally:
+        t.join(timeout=10)
+
+    assert repair_result["body"]["status"] == "HEALTHY"
+    assert repair_result["body"]["repaired_ranges"] == [[0, 1]]
+
+    # Convergence: later audits are HEALTHY; the receipt never moved.
+    final = store.audit("fix")
+    assert final["status"] == "HEALTHY"
+    assert final["abnormal_ranges"] == []
+    assert (
+        json.loads((tmp_path / "data" / "fix" / "receipt.json").read_text())
+        == receipt
+    )
+    assert not (tmp_path / "data" / "fix" / "repair").exists()
+
+
+def test_repair_plan_persists_frozen_scope_for_restart_style_resume(
+    client, tmp_path
+):
+    blob, _sha, receipt = _sealed_session(client, "fix")
+    os.unlink(_chunk_path(tmp_path, "fix", 0))
+    os.unlink(_chunk_path(tmp_path, "fix", 2))
+    web.store._stage_source("fix", blob)
+
+    plan_path = tmp_path / "data" / "fix" / "repair" / "plan.json"
+    plan = json.loads(plan_path.read_text())
+    assert plan["abnormal_ranges"] == [[0, 0], [2, 2]]
+    assert plan["missing_ranges"] == [[0, 0], [2, 2]]
+
+    body = client.post("/api/uploads/fix/audit").json()
+    assert body["status"] == "REPAIRING"
+    assert body["abnormal_ranges"] == [[0, 0], [2, 2]]
+    assert body["repair_started_at"] == plan["started_at"]
+    assert (
+        json.loads((tmp_path / "data" / "fix" / "receipt.json").read_text())
+        == receipt
+    )
+
+
+def test_audit_waits_for_marker_then_reports_repairing(client, tmp_path):
+    """An audit accepted in the gate->staging gap waits on the marker, not
+    on the whole repair, and still joins the repair window."""
+    blob, _sha, _ = _sealed_session(client, "fix")
+    os.unlink(_chunk_path(tmp_path, "fix", 0))
+    store = web.store
+    store._repair_chunk_delay = 0.2
+
+    # Simulate "accepted, not yet staged" using the internal registry.
+    registration = store._begin_repair("fix")
+    answers = {}
+
+    def do_audit():
+        answers["report"] = store.audit("fix")
+
+    t = threading.Thread(target=do_audit)
+    t.start()
+    time.sleep(0.1)
+    assert "report" not in answers  # waiting for the marker, not returning early
+
+    store._stage_source("fix", blob)
+    t.join(timeout=5)
+    report = answers["report"]
+    assert report["status"] == "REPAIRING"
+    assert report["abnormal_ranges"] == [[0, 0]]
+    store._end_repair(registration)
+
+    # converge
+    assert client.post("/api/uploads/fix/repair", content=blob).status_code == 200
+    assert store.audit("fix")["status"] == "HEALTHY"
+
+
+def test_http_concurrent_audit_during_repair_over_asgi(client, tmp_path):
+    """End-to-end through the FastAPI app in separate portal threads:
+    store-level locking is exercised (the repair write lock must not make
+    audits wait). Event-loop blocking is covered by the real-server test."""
+    blob, _sha, receipt = _sealed_session(client, "fix")
+    # Two later blocks missing: block 1 is restored first; while its settle
+    # delay runs, block 2 is still missing -> a genuine REPAIRING window.
+    os.unlink(_chunk_path(tmp_path, "fix", 1))
+    os.unlink(_chunk_path(tmp_path, "fix", 2))
+    web.store._repair_chunk_delay = 0.2
+
+    repair_status = {}
+
+    def do_repair():
+        r = client.post("/api/uploads/fix/repair", content=blob)
+        repair_status["code"] = r.status_code
+        repair_status["body"] = r.json()
+
+    t = threading.Thread(target=do_repair)
+    t.start()
+    try:
+        _wait_for(tmp_path / "data" / "fix" / "repair" / "source")
+        seen_repairing = False
+        for _ in range(6):
+            r = client.post("/api/uploads/fix/audit")
+            assert r.status_code == 200
+            body = r.json()
+            if body["status"] == "REPAIRING":
+                seen_repairing = True
+                assert body["abnormal_ranges"] == [[1, 2]]
+                assert body["sealed_at"] == receipt["sealed_at"]
+            else:
+                assert body["status"] == "HEALTHY"
+            time.sleep(0.05)
+        assert seen_repairing, "never observed REPAIRING inside the repair window"
+    finally:
+        t.join(timeout=10)
+
+    assert repair_status["code"] == 200
+    assert repair_status["body"]["repaired_ranges"] == [[1, 2]]
+    assert client.post("/api/uploads/fix/audit").json()["status"] == "HEALTHY"
+
+
+def test_concurrent_audit_against_real_http_server(tmp_path):
+    """One real uvicorn event loop: the async repair endpoint must not block
+    concurrent audits. Reproduces the reported bug end to end."""
+    import json as _json
+    import socket
+    import urllib.request
+    import uvicorn
+
+    # Prepare the damaged sealed session through the shared store.
+    store = UploadStore(str(tmp_path / "data"))
+    web.store = store
+    prep = TestClient(web.app)
+    blob = os.urandom(3 * CHUNK_SIZE)
+    digest = _digest(blob)
+    for i in range(3):
+        part = blob[i * CHUNK_SIZE : (i + 1) * CHUNK_SIZE]
+        r = prep.put(
+            "/api/uploads/fix/chunks",
+            content=part,
+            headers={
+                "X-Chunk-Offset": str(i * CHUNK_SIZE),
+                "X-Total-Size": str(len(blob)),
+                "X-Content-SHA256": digest,
+            },
+        )
+        assert r.status_code == 200
+    receipt = prep.post("/api/uploads/fix/seal").json()
+    os.unlink(_chunk_path(tmp_path, "fix", 0))
+    os.unlink(_chunk_path(tmp_path, "fix", 2))
+    store._repair_chunk_delay = 0.25
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    config = uvicorn.Config(
+        web.app, host="127.0.0.1", port=port, log_level="error",
+    )
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run)
+    thread.start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(base + "/health", timeout=1) as resp:
+                    if resp.status == 200:
+                        break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            raise AssertionError("test server never started")
+
+        def post(path, body=None):
+            req = urllib.request.Request(
+                base + path, data=body, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, _json.loads(resp.read())
+
+        repair_answer = {}
+
+        def do_repair():
+            try:
+                repair_answer["result"] = post(
+                    "/api/uploads/fix/repair", blob
+                )
+            except Exception as exc:  # pragma: no cover - surfaced below
+                repair_answer["error"] = exc
+
+        worker = threading.Thread(target=do_repair)
+        worker.start()
+        try:
+            _wait_for(tmp_path / "data" / "fix" / "repair" / "source")
+            statuses = []
+            saw_repairing = False
+            for _ in range(8):
+                start = time.time()
+                _, body = post("/api/uploads/fix/audit")
+                elapsed = time.time() - start
+                statuses.append(body["status"])
+                # Promptness: never wait for the repair to finish.
+                assert elapsed < 2.0, f"audit blocked {elapsed:.2f}s"
+                if body["status"] == "REPAIRING":
+                    saw_repairing = True
+                    assert body["abnormal_ranges"] == [[0, 0], [2, 2]]
+                    assert body["missing_ranges"] == [[0, 0], [2, 2]]
+                    assert body["sealed_at"] == receipt["sealed_at"]
+                else:
+                    assert body["status"] == "HEALTHY"
+                time.sleep(0.05)
+            assert saw_repairing, f"no REPAIRING observed, saw {statuses}"
+        finally:
+            worker.join(timeout=15)
+
+        assert "error" not in repair_answer, repair_answer["error"]
+        _, healed = repair_answer["result"]
+        assert healed["repaired_ranges"] == [[0, 0], [2, 2]]
+        _, final = post("/api/uploads/fix/audit")
+        assert final["status"] == "HEALTHY"
+        assert (
+            _json.loads(
+                (tmp_path / "data" / "fix" / "receipt.json").read_text()
+            )
+            == receipt
+        )
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+def test_duplicate_concurrent_repairs_keep_frozen_scope(client, tmp_path):
+    """Two valid repair submissions racing must not shrink the frozen
+    scope seen by concurrent audits."""
+    blob, _sha, receipt = _sealed_session(client, "fix")
+    os.unlink(_chunk_path(tmp_path, "fix", 0))
+    os.unlink(_chunk_path(tmp_path, "fix", 2))
+    web.store._repair_chunk_delay = 0.2
+
+    answers = {}
+
+    def do(label):
+        answers[label] = web.store.repair("fix", blob)
+
+    t1 = threading.Thread(target=do, args=("a",))
+    t1.start()
+    _wait_for(tmp_path / "data" / "fix" / "repair" / "source")
+
+    # While the first repair is applying, resubmit the same valid file.
+    t2 = threading.Thread(target=do, args=("b",))
+    t2.start()
+    try:
+        for _ in range(4):
+            body = client.post("/api/uploads/fix/audit").json()
+            assert body["status"] == "REPAIRING"
+            assert body["abnormal_ranges"] == [[0, 0], [2, 2]], body
+            time.sleep(0.05)
+    finally:
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+    for label, body in answers.items():
+        assert body["status"] == "HEALTHY", label
+    assert client.post("/api/uploads/fix/audit").json()["status"] == "HEALTHY"
+    assert not (tmp_path / "data" / "fix" / "repair").exists()
+    assert (
+        json.loads((tmp_path / "data" / "fix" / "receipt.json").read_text())
+        == receipt
+    )
+
+
+def test_restart_resumes_a_partially_applied_repair(client, tmp_path):
+    blob, _sha, receipt = _sealed_session(client, "fix")
+    os.unlink(_chunk_path(tmp_path, "fix", 0))
+    os.unlink(_chunk_path(tmp_path, "fix", 1))
+    web.store._stage_source("fix", blob)
+    # Crash after block 0 was replaced but before block 1.
+    _chunk_path(tmp_path, "fix", 0).write_bytes(blob[:CHUNK_SIZE])
+
+    data_dir = tmp_path / "data"
+    web.store = UploadStore(str(data_dir))
+
+    rebuilt = b"".join(
+        (data_dir / "fix" / "chunks" / f"{i:08d}").read_bytes() for i in range(3)
+    )
+    assert rebuilt == blob
+    assert client.post("/api/uploads/fix/audit").json()["status"] == "HEALTHY"
+    assert not (data_dir / "fix" / "repair").exists()
+    assert (
+        json.loads((data_dir / "fix" / "receipt.json").read_text()) == receipt
+    )
 
 
 # ---------------------------------------------------------------------------

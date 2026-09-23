@@ -13,6 +13,10 @@ services:
     environment:
       DATA_DIR: /data
       STATIC_DIR: /app/frontend/dist
+      # Per-chunk settle delay during a repair: keeps the REPAIRING window
+      # observable to concurrent audits over real HTTP. Override with
+      # REPAIR_CHUNK_DELAY=0 for production-like timing.
+      REPAIR_CHUNK_DELAY: "${REPAIR_CHUNK_DELAY:-0.25}"
     healthcheck:
       test:
         - CMD
@@ -35,6 +39,12 @@ services:
     container_name: sealing-desk-verify
     environment:
       BASE_URL: http://web:8000
+    volumes:
+      # Shared with web so the smoke (DATA_DIR defaults to /data) can
+      # manufacture a missing sealed chunk on disk and drive a concurrent
+      # audit-during-repair scenario over HTTP. pytest is unaffected: its
+      # conftest assigns a private temp DATA_DIR because none is exported.
+      - ./data:/data
     depends_on:
       web:
         condition: service_healthy

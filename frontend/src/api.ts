@@ -56,6 +56,9 @@ export interface AuditResult {
   checked_at?: string;
   completed_at?: string;
   already_healthy?: boolean;
+  // Present on REPAIRING reports: when the current repair started. The
+  // abnormal ranges of such a report are frozen to the repair-start scope.
+  repair_started_at?: string | null;
 }
 
 export class ApiError extends Error {

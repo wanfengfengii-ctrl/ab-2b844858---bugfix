@@ -6,6 +6,10 @@ Exercises the whole contract over real HTTP (stdlib only):
   identical receipt on repeated seal, and sealed-session immutability.
   Then: sealed-session integrity audit (HEALTHY), unsealed audit rejection,
   wrong-file / duplicate repair stability, and repair gating.
+  Finally: a missing sealed block is manufactured on the shared data
+  volume; while a repair runs, concurrent audits must answer promptly with
+  REPAIRING and a frozen abnormal scope, then converge to HEALTHY with the
+  original receipt untouched.
 """
 
 from __future__ import annotations
@@ -14,11 +18,13 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 
 BASE = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
 CHUNK = 65536
 
 
@@ -226,7 +232,114 @@ def main():
     status, body = call("POST", f"/api/uploads/{s}/audit")
     check(body["status"] == "HEALTHY", "session remains HEALTHY")
 
-    print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb})")
+    print("[repair window: concurrent audits observe REPAIRING promptly]")
+    # Fresh two-chunk sealed session; chunk 0 is then physically removed on
+    # the shared data volume (the verify container mounts the same /data).
+    r = f"REP{suffix}"
+    rblob = os.urandom(2 * CHUNK)
+    rdigest = hashlib.sha256(rblob).hexdigest()
+    rc0, rc1 = rblob[:CHUNK], rblob[CHUNK:]
+    status, _ = put(r, 0, rc0, len(rblob), rdigest)
+    check(status == 200, "repair-scenario chunk #0 accepted")
+    status, _ = put(r, CHUNK, rc1)
+    check(status == 200, "repair-scenario chunk #1 accepted")
+    status, rreceipt = call("POST", f"/api/uploads/{r}/seal")
+    check(status == 200 and rreceipt["sha256"] == rdigest, "repair scenario sealed")
+
+    rdir = os.path.join(DATA_DIR, r, "chunks")
+    missing_path = os.path.join(rdir, "00000000")
+    deadline = time.time() + 10
+    while not os.path.exists(missing_path):
+        check(time.time() < deadline, "sealed chunk file never appeared on volume")
+        time.sleep(0.05)
+    os.unlink(missing_path)
+
+    status, body = call("POST", f"/api/uploads/{r}/audit")
+    check(status == 200 and body["status"] == "DEGRADED"
+          and body["missing_ranges"] == [[0, 0]]
+          and body["abnormal_ranges"] == [[0, 0]],
+          f"missing block reported DEGRADED: {body}")
+    # the legacy chunk upload must never refill a sealed (damaged) block
+    status, _ = put(r, 0, rc0)
+    check(status == 409, "sealed missing block cannot be rewritten via PUT")
+    check(not os.path.exists(missing_path), "block file still absent after 409")
+    # a wrong original file is rejected and changes nothing
+    wrong = bytearray(rblob)
+    wrong[3] ^= 0x01
+    status, body = call("POST", f"/api/uploads/{r}/repair", body=bytes(wrong))
+    check(status == 409 and body.get("reason") == "digest_mismatch",
+          "wrong repair file rejected with digest_mismatch")
+    status, body = call("POST", f"/api/uploads/{r}/audit")
+    check(body["status"] == "DEGRADED"
+          and body["missing_ranges"] == [[0, 0]],
+          "rejected repair leaves the DEGRADED scope untouched")
+
+    repair_answer = {}
+
+    def do_repair():
+        repair_answer.update(
+            zip(("status", "body"), call("POST", f"/api/uploads/{r}/repair", body=rblob))
+        )
+
+    worker = threading.Thread(target=do_repair)
+    worker.start()
+    saw_repairing = False
+    frozen_scopes = set()
+    plan_dir = os.path.join(DATA_DIR, r, "repair")
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            t0 = time.time()
+            status, body = call("POST", f"/api/uploads/{r}/audit")
+            elapsed = time.time() - t0
+            check(status == 200, f"concurrent audit HTTP 200, got {status}")
+            # Promptness is the core regression: never wait for repair end.
+            check(elapsed < 3.0, f"concurrent audit blocked for {elapsed:.2f}s")
+            if body["status"] == "REPAIRING":
+                saw_repairing = True
+                check(body["abnormal_ranges"] == [[0, 0]],
+                      f"REPAIRING reports frozen start scope: {body}")
+                check(body["missing_ranges"] == [[0, 0]],
+                      "REPAIRING missing range is the repair-start one")
+                check(bool(body.get("repair_started_at")),
+                      "REPAIRING report carries repair_started_at")
+                check(body["sealed_at"] == rreceipt["sealed_at"],
+                      "sealed_at unchanged during repair")
+                frozen_scopes.add(json.dumps(body["abnormal_ranges"]))
+            elif body["status"] == "HEALTHY":
+                if saw_repairing:
+                    break
+            time.sleep(0.02)
+        check(saw_repairing, "observed REPAIRING inside the repair window")
+    finally:
+        worker.join(timeout=30)
+    check(not worker.is_alive(), "repair request returned")
+
+    check(repair_answer.get("status") == 200, f"repair -> 200: {repair_answer}")
+    rbody = repair_answer["body"]
+    check(rbody["status"] == "HEALTHY"
+          and rbody["repaired_ranges"] == [[0, 0]]
+          and rbody["sealed_at"] == rreceipt["sealed_at"],
+          f"repair converged and restored block 0: {rbody}")
+    check(len(frozen_scopes) == 1, "scope never drifted while repairing")
+    check(not os.path.isdir(plan_dir), "repair marker directory removed after convergence")
+
+    status, body = call("POST", f"/api/uploads/{r}/audit")
+    check(body["status"] == "HEALTHY" and body["abnormal_ranges"] == [],
+          "post-repair audits converge to HEALTHY")
+    with open(os.path.join(DATA_DIR, r, "receipt.json"), "rb") as fh:
+        on_disk_receipt = json.loads(fh.read())
+    check(on_disk_receipt == rreceipt, "sealed receipt file is byte-equivalent after repair")
+
+    status, body = call("POST", f"/api/uploads/{r}/repair", body=rblob)
+    check(status == 200 and body.get("already_healthy") is True
+          and body["repaired_ranges"] == []
+          and body["sealed_at"] == rreceipt["sealed_at"],
+          "repeated repair after convergence stays idempotent")
+    status, _ = put(r, 0, bytes(CHUNK))
+    check(status == 409, "repaired sealed chunk still cannot be rewritten via PUT")
+
+    print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb}, {r})")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import re
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -97,7 +98,11 @@ async def put_chunk(
         )
 
     data = await request.body()
-    return store.put_chunk(session, offset, data, total_size, sha256)
+    # Chunk writes fsync under the store lock; keep them off the event loop
+    # so concurrent requests (e.g. audits) stay responsive.
+    return await run_in_threadpool(
+        store.put_chunk, session, offset, data, total_size, sha256
+    )
 
 
 @app.post("/api/uploads/{session}/seal")
@@ -162,7 +167,10 @@ async def repair(session: str, request: Request) -> JSONResponse:
             detail="request body must be the complete original file",
         )
     try:
-        result = store.repair(session, data)
+        # Repair replaces chunks under the store lock with fsyncs; running
+        # it in the threadpool keeps concurrent audits of the repair window
+        # responsive instead of queuing behind the event loop.
+        result = await run_in_threadpool(store.repair, session, data)
     except RejectError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     except ConflictError as exc:
