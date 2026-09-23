@@ -6,6 +6,10 @@ Exercises the whole contract over real HTTP (stdlib only):
   identical receipt on repeated seal, and sealed-session immutability.
   Then: sealed-session integrity audit (HEALTHY), unsealed audit rejection,
   wrong-file / duplicate repair stability, and repair gating.
+  Finally: the repair-window scenario — a repair started against a session
+  with a fabricated missing block, with concurrent audits that must return
+  promptly as REPAIRING with the stable, repair-start abnormal scope and
+  converge to HEALTHY afterwards (receipt and sealed_at untouched).
 """
 
 from __future__ import annotations
@@ -14,12 +18,17 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 
 BASE = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 CHUNK = 65536
+# The web service's data directory, mounted into this one-shot container.
+# Needed only to fabricate the missing sealed chunk for the repair window
+# scenario; when unset, that section is skipped (it always runs in compose).
+WEB_DATA_DIR = os.environ.get("WEB_DATA_DIR", "").rstrip("/")
 
 
 def call(method: str, path: str, body: bytes | None = None, headers=None):
@@ -225,6 +234,123 @@ def main():
     check(status == 409, "sealed chunk rewrite via PUT -> 409")
     status, body = call("POST", f"/api/uploads/{s}/audit")
     check(body["status"] == "HEALTHY", "session remains HEALTHY")
+
+    # ------------------------------------------------------------------
+    # Repair window: repair started, abnormal blocks not yet replaced, and
+    # concurrent audits must come back promptly as REPAIRING with the stable
+    # start-of-repair scope, then converge to HEALTHY.
+    # ------------------------------------------------------------------
+    print("[repair window: concurrent audits REPAIRING, then HEALTHY]")
+    if not WEB_DATA_DIR:
+        print("  skipped (WEB_DATA_DIR not mounted into this container)")
+    else:
+        rs = s + "R"
+        rblob = os.urandom(2 * CHUNK + 45)
+        rsha = hashlib.sha256(rblob).hexdigest()
+        rc0, rc1, rc2 = rblob[:CHUNK], rblob[CHUNK:2 * CHUNK], rblob[2 * CHUNK:]
+        for off, part in ((0, rc0), (CHUNK, rc1), (2 * CHUNK, rc2)):
+            stt, _ = put(rs, off, part, len(rblob), rsha)
+            check(stt == 200, f"repair-scenario chunk at {off} accepted")
+        stt, rreceipt = call("POST", f"/api/uploads/{rs}/seal")
+        check(stt == 200, "repair-scenario session sealed")
+
+        # Fabricate damage on disk: block 0 missing, block 2 bit-rotted.
+        c0_path = os.path.join(WEB_DATA_DIR, rs, "chunks", "00000000")
+        c2_path = os.path.join(WEB_DATA_DIR, rs, "chunks", "00000002")
+        os.unlink(c0_path)
+        with open(c2_path, "wb") as fh:
+            rot = bytearray(rc2)
+            rot[4] ^= 0x7E
+            fh.write(bytes(rot))
+        stt, pre = call("POST", f"/api/uploads/{rs}/audit")
+        check(stt == 200 and pre["status"] == "DEGRADED"
+              and pre["missing_ranges"] == [[0, 0]]
+              and pre["block_digest_error_ranges"] == [[2, 2]]
+              and pre["abnormal_ranges"] == [[0, 0], [2, 2]],
+              f"fabricated damage classified DEGRADED: {pre}")
+
+        repair_holder: dict = {}
+
+        def do_repair():
+            try:
+                repair_holder["result"] = call(
+                    "POST", f"/api/uploads/{rs}/repair", body=rblob
+                )
+            except Exception as exc:  # surfaced below, never silent
+                repair_holder["error"] = exc
+
+        repair_thread = threading.Thread(target=do_repair, daemon=True)
+        repair_thread.start()
+
+        marker_dir = os.path.join(WEB_DATA_DIR, rs, "repair")
+        source_path = os.path.join(marker_dir, "source")
+        plan_path = os.path.join(marker_dir, "plan.json")
+        deadline = time.time() + 10
+        while not (os.path.exists(source_path) and os.path.exists(plan_path)):
+            if not repair_thread.is_alive() or time.time() > deadline:
+                raise SystemExit(
+                    f"repair marker never appeared: {repair_holder}"
+                )
+            time.sleep(0.01)
+
+        repairing: list[dict] = []
+        # Audit repeatedly while the repair request is still in flight.
+        while repair_thread.is_alive():
+            t0 = time.monotonic()
+            stt, report = call("POST", f"/api/uploads/{rs}/audit")
+            elapsed = time.monotonic() - t0
+            if elapsed >= 5.0:
+                raise SystemExit(
+                    f"concurrent audit blocked behind the repair ({elapsed:.2f}s)"
+                )
+            if stt == 200 and report.get("status") == "REPAIRING":
+                if report["missing_ranges"] != [[0, 0]]:
+                    raise SystemExit(f"REPAIRING missing scope drifted: {report}")
+                if report["block_digest_error_ranges"] != [[2, 2]]:
+                    raise SystemExit(f"REPAIRING digest-error scope drifted: {report}")
+                if report["abnormal_ranges"] != [[0, 0], [2, 2]]:
+                    raise SystemExit(f"REPAIRING abnormal scope drifted: {report}")
+                if report["repaired_ranges"] != [] or not report.get("repair_started_at"):
+                    raise SystemExit(f"unexpected REPAIRING report fields: {report}")
+                repairing.append(report)
+            time.sleep(0.02)
+
+        repair_thread.join(timeout=10)
+        if "error" in repair_holder:
+            raise SystemExit(f"repair thread errored: {repair_holder['error']}")
+        if not repairing:
+            raise SystemExit("no concurrent audit observed REPAIRING during the window")
+        print(f"  ok - {len(repairing)} concurrent audits returned REPAIRING promptly")
+        # All REPAIRING reports within the same window agree except checked_at.
+        def stable_fields(b):
+            return {k: v for k, v in b.items() if k != "checked_at"}
+        check(
+            all(stable_fields(b) == stable_fields(repairing[0]) for b in repairing),
+            "REPAIRING scope does not drift while chunks are restored",
+        )
+
+        rstt, rdone = repair_holder["result"]
+        check(rstt == 200 and rdone["status"] == "HEALTHY"
+              and rdone["repaired_ranges"] == [[0, 0], [2, 2]]
+              and rdone["sealed_at"] == rreceipt["sealed_at"],
+              f"repair completed HEALTHY with the damaged blocks: {rdone}")
+
+        # Subsequent audits converge; receipt file and sealed_at are intact.
+        stt, post = call("POST", f"/api/uploads/{rs}/audit")
+        check(stt == 200 and post["status"] == "HEALTHY"
+              and post["abnormal_ranges"] == []
+              and post["sealed_at"] == rreceipt["sealed_at"],
+              "post-repair audit converges to HEALTHY")
+        with open(os.path.join(WEB_DATA_DIR, rs, "receipt.json"), "rb") as fh:
+            on_disk_receipt = json.loads(fh.read())
+        check(on_disk_receipt == rreceipt, "receipt.json byte-identical after repair")
+        check(not os.path.exists(marker_dir), "repair marker directory removed")
+
+        # Sealed chunks still cannot be rewritten through the chunk API.
+        status, _ = put(rs, 0, bytes(CHUNK))
+        check(status == 409, "repaired sealed chunk still rejects PUT rewrites")
+        stt, post2 = call("POST", f"/api/uploads/{rs}/audit")
+        check(post2["status"] == "HEALTHY", "rejected rewrite leaves session HEALTHY")
 
     print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb})")
 

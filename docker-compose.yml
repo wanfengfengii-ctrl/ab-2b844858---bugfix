@@ -13,6 +13,10 @@ services:
     environment:
       DATA_DIR: /data
       STATIC_DIR: /app/frontend/dist
+      # Pause after each replaced chunk so a real repair stays observable
+      # over HTTP (concurrent audits can reliably report REPAIRING). The
+      # knob defaults to 0; only abnormal blocks pay the wait.
+      REPAIR_CHUNK_DELAY: "0.35"
     healthcheck:
       test:
         - CMD
@@ -35,6 +39,12 @@ services:
     container_name: sealing-desk-verify
     environment:
       BASE_URL: http://web:8000
+      # Same persistent directory the web service uses: the smoke run needs
+      # to fabricate a missing sealed chunk on disk before repairing it.
+      # (Backend tests keep their own temp dir via DATA_DIR defaults.)
+      WEB_DATA_DIR: /data
+    volumes:
+      - ./data:/data
     depends_on:
       web:
         condition: service_healthy

@@ -7,6 +7,7 @@ import re
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -162,7 +163,9 @@ async def repair(session: str, request: Request) -> JSONResponse:
             detail="request body must be the complete original file",
         )
     try:
-        result = store.repair(session, data)
+        # Offload the blocking, potentially long chunk-replacement loop:
+        # running it on the event loop would stall concurrent audits.
+        result = await run_in_threadpool(store.repair, session, data)
     except RejectError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     except ConflictError as exc:

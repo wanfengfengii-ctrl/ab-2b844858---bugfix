@@ -56,6 +56,9 @@ export interface AuditResult {
   checked_at?: string;
   completed_at?: string;
   already_healthy?: boolean;
+  // Present only on REPAIRING reports: when the in-flight repair started;
+  // the reported ranges are frozen to that moment and do not drift.
+  repair_started_at?: string;
 }
 
 export class ApiError extends Error {

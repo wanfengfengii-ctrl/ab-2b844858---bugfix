@@ -233,8 +233,9 @@ export default function App() {
             : "完整性复核通过，并已为该旧会话补建可信逐块索引。",
         );
       } else if (result.status === "REPAIRING") {
-        setNotice("修复仍在进行（可能因上次替换中断）：请重新提交完整原文件以继续并收敛。");
-      } else {
+        setNotice(
+          "修复正在进行：复核即时返回，报告修复开始时确认的异常范围（同一次修复期间保持稳定，不随分块恢复而漂移）。修复完成后再次复核将收敛为 HEALTHY；若为上次中断遗留，重新提交完整原文件即可继续。",
+        );
         setNotice("完整性复核未通过：发现异常块，详情见下方复核报告，可提交完整原文件修复。");
       }
     } catch (e) {
@@ -413,6 +414,13 @@ export default function App() {
               <AuditLine label="缺块" ranges={audit.missing_ranges} />
               <AuditLine label="长度异常块" ranges={audit.length_error_ranges} />
               <AuditLine label="摘要不符块" ranges={audit.block_digest_error_ranges} />
+              {audit.status === "REPAIRING" && (
+                <div className="meta">
+                  复核于修复窗口内即时返回；以下异常范围为本次修复开始时确认的
+                  快照{audit.repair_started_at ? `（修复开始 ${audit.repair_started_at}）` : ""}，
+                  修复推进期间连续复核所见范围保持稳定，不随分块逐步恢复而漂移。
+                </div>
+              )}
               {audit.unlocatable_digest_mismatch && (
                 <div className="bad">
                   整文件摘要不符且无法定位到具体块（旧会话无逐块索引）：请提交完整原文件修复。
